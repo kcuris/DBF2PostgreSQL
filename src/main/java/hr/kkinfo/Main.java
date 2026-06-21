@@ -11,11 +11,14 @@ import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 public class Main {
     public static final String CHARSET = "Windows-1250";
+    public static final int DEFAULT_TAX_GROUP = 9;
 
     public static  String url ;
     public static  String user;
@@ -28,14 +31,18 @@ public class Main {
         user = config.getUser();
         password = config.getPassword();
 
-        String directoryPath = args[0];
+        String directoryPath = (args != null && args.length > 0) ? args[0] : System.getProperty("user.dir");
         File directory = new File(directoryPath);
 
-        if (!directory.exists()) {
-            throw new FileNotFoundException("Directory does not exist: " + directoryPath);
+        if (!directory.exists() || !directory.isDirectory()) {
+            // Fallback to current working directory of the application
+            directoryPath = System.getProperty("user.dir");
+            directory = new File(directoryPath);
         }
 
         List<DBF> dbfFiles = findDbfFiles(directory);
+
+        generateOutputSql(dbfFiles, "output.sql");
 
         List<String> ddls = createDDLs(dbfFiles);
         List<String> inserts = createInsert(dbfFiles);
@@ -44,6 +51,121 @@ public class Main {
         writeSqlToDatabase(ddls, inserts);
         System.out.println("done");
 
+    }
+
+    private static void generateOutputSql(List<DBF> dbfFiles, String fileName) throws IOException {
+        DBF skladDbf = null;
+        DBF barcodeDbf = null;
+        DBF trgovciDbf = null;
+        for (DBF dbf : dbfFiles) {
+            if (dbf.getName().equalsIgnoreCase("SKLAD.DBF")) {
+                skladDbf = dbf;
+            } else if (dbf.getName().equalsIgnoreCase("BARCODE.DBF")) {
+                barcodeDbf = dbf;
+            } else if (dbf.getName().equalsIgnoreCase("TRGOVCI.DBF")) {
+                trgovciDbf = dbf;
+            }
+        }
+
+        if (skladDbf == null) {
+            System.out.println("SKLAD.DBF not found, skipping output.sql generation.");
+            return;
+        }
+
+        Map<String, String> barcodeMap = new HashMap<>();
+        if (barcodeDbf != null) {
+            File barcodeFile = new File(barcodeDbf.getName());
+            try (DBF dbf = new DBF(new FileInputStream(barcodeFile), barcodeFile.getName())) {
+                DbfRecord record;
+                while ((record = dbf.read()) != null) {
+                    String sif = getFieldValue(record, "SIF", dbf);
+                    String code = getFieldValue(record, "CODE", dbf);
+                    if (!sif.isBlank() && !code.isBlank()) {
+                        barcodeMap.put(sif, code);
+                    }
+                }
+            }
+        }
+
+        File skladFile = new File(skladDbf.getName());
+        try (DBF dbf = new DBF(new FileInputStream(skladFile), skladDbf.getName())) {
+            List<String> sqls = new ArrayList<>();
+            List<String> itemPriceSqls = new ArrayList<>();
+            
+            sqls.add("-- Display Group");
+            sqls.add("INSERT INTO public.display_group (id, name, code, description, icon_id, color, sort_order) " +
+                    "VALUES (1, 'Default', 'DEF', 'Default Group', NULL, NULL, 1) ON CONFLICT (id) DO NOTHING;");
+            
+            itemPriceSqls.add("\n-- Items and Prices");
+            
+            DbfRecord record;
+            while ((record = dbf.read()) != null) {
+                String artikal = getFieldValue(record, "artikal", dbf).replace("'", "''");
+                String sifra = getFieldValue(record, "sifra", dbf).replace("'", "''");
+                String cijenaStr = getFieldValue(record, "cijena", dbf);
+                if (cijenaStr.isBlank()) cijenaStr = "0";
+
+                // Check for barcode override
+                String code = barcodeMap.getOrDefault(sifra, sifra);
+
+                // Item insert
+                String itemSql = String.format(
+                    "INSERT INTO public.item (name, code, description, unit_id, for_sale, deposit_refund, tax_group_id, display_group_id, complex) " +
+                    "VALUES ('%s', '%s', '%s', 1, true, 0, %d, 1, false);",
+                    artikal, code, artikal, DEFAULT_TAX_GROUP
+                );
+                itemPriceSqls.add(itemSql);
+
+                // Price insert - using subquery to find item_id by code
+                String priceSql = String.format(
+                    "INSERT INTO public.price (item_id, valid_from, valid_until, price) " +
+                    "VALUES ((SELECT id FROM public.item WHERE code = '%s' LIMIT 1), '2026-01-01', NULL, %s);",
+                    code, cijenaStr
+                );
+                itemPriceSqls.add(priceSql);
+            }
+
+            sqls.addAll(itemPriceSqls);
+
+            if (trgovciDbf != null) {
+                sqls.add("\n-- Users");
+                File trgovciFile = new File(trgovciDbf.getName());
+                try (DBF tDbf = new DBF(new FileInputStream(trgovciFile), trgovciFile.getName())) {
+                    DbfRecord tRecord;
+                    while ((tRecord = tDbf.read()) != null) {
+                        String ime = getFieldValue(tRecord, "IME", tDbf).replace("'", "''");
+                        String oib = getFieldValue(tRecord, "OIBTR", tDbf);
+                        
+                        String username = ime.toLowerCase().replace(" ", ".");
+                        if (username.isBlank()) continue;
+
+                        String userSql = String.format(
+                            "INSERT INTO public.users (username, \"name\", oib, email, \"password\", enabled) " +
+                            "VALUES ('%s', '%s', '%s', NULL, NULL, true);",
+                            username, ime, oib
+                        );
+                        sqls.add(userSql);
+                    }
+                }
+            }
+
+            try (PrintWriter writer = new PrintWriter(new BufferedWriter(new FileWriter(fileName)))) {
+                for (String sql : sqls) {
+                    writer.println(sql);
+                }
+            }
+            System.out.println("Generated " + fileName);
+        }
+    }
+
+    private static String getFieldValue(DbfRecord record, String fieldName, DBF dbf) throws IOException {
+        DbfField field = dbf.getMetadata().getField(fieldName);
+        if (field == null) {
+            // Try uppercase
+            field = dbf.getMetadata().getField(fieldName.toUpperCase());
+        }
+        if (field == null) return "";
+        return new String(Arrays.copyOfRange(record.getBytes(), field.getOffset(), field.getOffset() + field.getLength()), CHARSET).trim();
     }
 
     private static List<DBF> findDbfFiles(File directory) {
@@ -96,7 +218,7 @@ public class Main {
 
     private static String createDropDDL(DBF dbf) {
         String tableName = dbf.getName().replace(".DBF", "").replace(".dbf", "");
-        return "DROP TABLE " + tableName + "; \n";
+        return "DROP TABLE IF EXISTS " + tableName + "; \n";
     }
 
     private static List<String> createInsert(List<DBF> dbfFiles) throws IOException {
